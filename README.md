@@ -15,7 +15,7 @@ Lý do đặt tên:
 ## Files trong folder này
 
 - `anthropic_adapter.py`: bản clone hiện tại của file đã patch.
-- `anthropic_adapter.patch`: git diff của thay đổi so với Hermes upstream checkout hiện tại.
+- `anthropic_adapter.patch`: git diff của thay đổi so với Hermes upstream checkout hiện tại, gồm curl_cffi + SSE streaming.
 - `README.md`: tài liệu này.
 
 ## Vấn đề kỹ thuật
@@ -36,6 +36,15 @@ impersonate="safari17_0"
 ```
 
 Điểm quan trọng: đây không chỉ là đổi HTTP header. `curl_cffi` thay đổi TLS ClientHello/fingerprint để giống Safari 17 hơn. Cloudflare nhìn thấy fingerprint giống browser hơn nên không chặn.
+
+Bản mới cũng hỗ trợ **real Anthropic SSE streaming** cho NKQ:
+
+- `messages.stream()` gửi `stream: true`.
+- Parse `text/event-stream` từ `/v1/messages`.
+- Yield lại event giống Anthropic SDK: `content_block_start`, `content_block_delta`, `message_delta`, `message_stop`.
+- Reconstruct final message cho `get_final_message()`.
+- Khi gặp `tool_use`, Hermes/Telegram có thể nhận event sớm để hiện progress thay vì chờ model generate xong toàn bộ.
+- Nếu NKQ trả 2xx nhưng không phải SSE, fallback về blocking `create()` như bản cũ. Không fallback trên HTTP error như 429 để tránh double-spend request.
 
 ## File Hermes gốc cần patch
 
@@ -172,6 +181,29 @@ if _is_nkq_anthropic_endpoint(base_url):
     return _CurlCffiAnthropicClient(api_key, base_url, timeout)
 ```
 
+## Streaming behavior
+
+Bản patch mới đã test được NKQ streaming thật:
+
+```text
+content-type: text/event-stream; charset=utf-8
+event: content_block_start  # thinking/text/tool_use
+event: content_block_delta  # thinking_delta/text_delta/input_json_delta/signature_delta
+event: message_delta
+event: message_stop
+```
+
+Tool-call streaming test đã thấy:
+
+```text
+event content_block_start block tool_use get_weather
+event content_block_delta delta input_json_delta {"city": "Hanoi"}
+final stop: tool_use
+final block: tool_use get_weather {'city': 'Hanoi'}
+```
+
+Điều này giải quyết silent gap do bản cũ fake stream nhưng `__iter__` rỗng.
+
 ## Cách verify sau khi restore
 
 Chạy smoke test từ Hermes checkout:
@@ -221,7 +253,7 @@ OpenCode chạy trên Node.js và dùng stack HTTP/TLS khác. Từ cùng VPS, Op
 - `curl_cffi` là package trong venv/site-packages: Hermes update thường không xóa trực tiếp, nhưng recreate venv thì có thể mất.
 - `anthropic_adapter.py` là file trong Hermes source: Hermes update rất có thể ghi đè.
 - Patch hiện tại chỉ activate khi `base_url` chứa `api.nkq.vn`; các endpoint Anthropic khác vẫn dùng client mặc định.
-- Stream hiện tại là non-streaming fallback: `stream()` gọi `create()` và trả final message, không có incremental SDK events.
+- Stream hiện tại là real SSE streaming qua `curl_cffi` nếu NKQ trả `text/event-stream`; có fallback blocking nếu endpoint trả 2xx non-SSE.
 
 ## Checklist sau Hermes update
 

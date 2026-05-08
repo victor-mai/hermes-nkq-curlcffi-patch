@@ -515,22 +515,141 @@ def _common_betas_for_base_url(
 class _CurlCffiAnthropicStream:
     def __init__(self, messages_client: "_CurlCffiAnthropicMessages", kwargs: dict):
         self._messages_client = messages_client
-        self._kwargs = kwargs
+        self._kwargs = dict(kwargs)
+        self._response = None
         self._final_message = None
+        self._fallback_to_create = False
+        self._message: dict = {}
+        self._content_blocks: dict[int, dict] = {}
+        self._tool_json_parts: dict[int, list[str]] = {}
 
     def __enter__(self):
-        self._final_message = self._messages_client.create(**self._kwargs)
+        self._response = self._messages_client._post(self._kwargs, stream=True)
+        if self._response.status_code >= 400:
+            raise RuntimeError(self._response.text)
+        content_type = (getattr(self._response, "headers", {}) or {}).get("content-type", "")
+        if "text/event-stream" not in content_type.lower():
+            # Endpoint ignored/does not support stream=True. Keep the known-good
+            # blocking behavior instead of breaking NKQ access entirely.
+            self._fallback_to_create = True
+            self._final_message = self._messages_client.create(**self._kwargs)
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        close = getattr(self._response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
         return False
 
     def __iter__(self):
-        # Non-streaming fallback: final response is fetched in __enter__ and
-        # returned via get_final_message(), so no incremental SDK events exist.
-        return iter(())
+        if self._fallback_to_create:
+            return iter(())
+        return self._iter_sse_events()
+
+    def _iter_sse_events(self):
+        event_type = None
+        data_lines: list[str] = []
+        for raw_line in self._response.iter_lines():
+            if isinstance(raw_line, bytes):
+                line = raw_line.decode("utf-8", "replace")
+            else:
+                line = str(raw_line)
+            if line == "":
+                if data_lines:
+                    payload_text = "\n".join(data_lines)
+                    try:
+                        payload = json.loads(payload_text)
+                    except json.JSONDecodeError:
+                        event_type = None
+                        data_lines = []
+                        continue
+                    event = self._event_from_payload(event_type, payload)
+                    self._apply_event_payload(payload)
+                    yield event
+                event_type = None
+                data_lines = []
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event_type = line.split(":", 1)[1].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line.split(":", 1)[1].lstrip())
+
+        # Some iter_lines implementations omit the final blank line.
+        if data_lines:
+            try:
+                payload = json.loads("\n".join(data_lines))
+            except json.JSONDecodeError:
+                return
+            event = self._event_from_payload(event_type, payload)
+            self._apply_event_payload(payload)
+            yield event
+
+    def _event_from_payload(self, event_type: str, payload: dict):
+        if event_type and "type" not in payload:
+            payload = {**payload, "type": event_type}
+        return self._messages_client._to_namespace(payload)
+
+    def _apply_event_payload(self, payload: dict) -> None:
+        payload_type = payload.get("type")
+        if payload_type == "message_start":
+            self._message = dict(payload.get("message") or {})
+            self._message["content"] = []
+        elif payload_type == "content_block_start":
+            index = int(payload.get("index", len(self._content_blocks)))
+            block = dict(payload.get("content_block") or {})
+            self._content_blocks[index] = block
+            if block.get("type") == "tool_use":
+                self._tool_json_parts[index] = []
+        elif payload_type == "content_block_delta":
+            index = int(payload.get("index", 0))
+            delta = payload.get("delta") or {}
+            block = self._content_blocks.setdefault(index, {})
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                block["text"] = block.get("text", "") + (delta.get("text") or "")
+            elif delta_type == "thinking_delta":
+                block["thinking"] = block.get("thinking", "") + (delta.get("thinking") or "")
+            elif delta_type == "signature_delta":
+                block["signature"] = delta.get("signature")
+            elif delta_type == "input_json_delta":
+                self._tool_json_parts.setdefault(index, []).append(delta.get("partial_json") or "")
+        elif payload_type == "content_block_stop":
+            index = int(payload.get("index", 0))
+            block = self._content_blocks.get(index)
+            if block and block.get("type") == "tool_use":
+                raw_input = "".join(self._tool_json_parts.get(index, []))
+                if raw_input:
+                    try:
+                        block["input"] = json.loads(raw_input)
+                    except json.JSONDecodeError:
+                        block.setdefault("input", {})
+        elif payload_type == "message_delta":
+            delta = payload.get("delta") or {}
+            self._message.update(delta)
+            if payload.get("usage") is not None:
+                self._message["usage"] = payload["usage"]
+        elif payload_type == "message_stop":
+            self._final_message = self._build_final_message()
+        elif payload_type == "error":
+            raise RuntimeError(json.dumps(payload.get("error") or payload, ensure_ascii=False))
+
+    def _build_final_message(self):
+        message = dict(self._message or {})
+        message["content"] = [
+            self._content_blocks[i]
+            for i in sorted(self._content_blocks)
+            if self._content_blocks.get(i) is not None
+        ]
+        return self._messages_client._to_namespace(message)
 
     def get_final_message(self):
+        if self._final_message is None and not self._fallback_to_create:
+            self._final_message = self._build_final_message()
         return self._final_message
 
 
@@ -541,27 +660,27 @@ class _CurlCffiAnthropicMessages:
         self._timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
 
     @staticmethod
-    def _to_namespace(value):
+    def _to_namespace(value, *, _plain: bool = False):
+        if _plain:
+            return value
         if isinstance(value, dict):
-            return SimpleNamespace(**{k: _CurlCffiAnthropicMessages._to_namespace(v) for k, v in value.items()})
+            return SimpleNamespace(**{
+                k: _CurlCffiAnthropicMessages._to_namespace(v, _plain=(k == "input"))
+                for k, v in value.items()
+            })
         if isinstance(value, list):
             return [_CurlCffiAnthropicMessages._to_namespace(v) for v in value]
         return value
 
-    def create(self, **kwargs):
-        try:
-            from curl_cffi import requests as curl_requests
-        except ImportError as exc:
-            raise ImportError(
-                "curl_cffi is required for NKQ's Cloudflare-protected Anthropic endpoint. "
-                "Install with: uv pip install curl_cffi"
-            ) from exc
-
-        extra_headers = kwargs.pop("extra_headers", None) or {}
-        extra_body = kwargs.pop("extra_body", None) or {}
-        kwargs.pop("extra_query", None)
+    def _prepare_request(self, kwargs: dict, *, stream: bool = False):
+        request_kwargs = dict(kwargs)
+        extra_headers = request_kwargs.pop("extra_headers", None) or {}
+        extra_body = request_kwargs.pop("extra_body", None) or {}
+        request_kwargs.pop("extra_query", None)
         if isinstance(extra_body, dict):
-            kwargs.update(extra_body)
+            request_kwargs.update(extra_body)
+        if stream:
+            request_kwargs["stream"] = True
 
         endpoint = self._base_url
         if not endpoint.endswith("/v1"):
@@ -574,13 +693,29 @@ class _CurlCffiAnthropicMessages:
             "anthropic-version": "2023-06-01",
             **extra_headers,
         }
-        response = curl_requests.post(
+        return url, headers, request_kwargs
+
+    def _post(self, kwargs: dict, *, stream: bool = False):
+        try:
+            from curl_cffi import requests as curl_requests
+        except ImportError as exc:
+            raise ImportError(
+                "curl_cffi is required for NKQ's Cloudflare-protected Anthropic endpoint. "
+                "Install with: uv pip install curl_cffi"
+            ) from exc
+
+        url, headers, request_kwargs = self._prepare_request(kwargs, stream=stream)
+        return curl_requests.post(
             url,
             headers=headers,
-            data=json.dumps(kwargs),
+            data=json.dumps(request_kwargs),
             impersonate="safari17_0",
             timeout=self._timeout,
+            stream=stream,
         )
+
+    def create(self, **kwargs):
+        response = self._post(kwargs, stream=False)
         if response.status_code >= 400:
             raise RuntimeError(response.text)
         return self._to_namespace(response.json())
