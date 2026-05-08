@@ -1,0 +1,117 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index eb6b3e79a..f576178f1 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -17,6 +17,7 @@ import os
+ import platform
+ import subprocess
+ from pathlib import Path
++from types import SimpleNamespace
+ 
+ from hermes_constants import get_hermes_home
+ from typing import Any, Dict, List, Optional, Tuple
+@@ -511,6 +512,92 @@ def _common_betas_for_base_url(
+     return betas
+ 
+ 
++class _CurlCffiAnthropicStream:
++    def __init__(self, messages_client: "_CurlCffiAnthropicMessages", kwargs: dict):
++        self._messages_client = messages_client
++        self._kwargs = kwargs
++        self._final_message = None
++
++    def __enter__(self):
++        self._final_message = self._messages_client.create(**self._kwargs)
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        return False
++
++    def __iter__(self):
++        # Non-streaming fallback: final response is fetched in __enter__ and
++        # returned via get_final_message(), so no incremental SDK events exist.
++        return iter(())
++
++    def get_final_message(self):
++        return self._final_message
++
++
++class _CurlCffiAnthropicMessages:
++    def __init__(self, api_key: str, base_url: str, timeout: float = None):
++        self._api_key = api_key
++        self._base_url = (base_url or "https://api.anthropic.com").rstrip("/")
++        self._timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
++
++    @staticmethod
++    def _to_namespace(value):
++        if isinstance(value, dict):
++            return SimpleNamespace(**{k: _CurlCffiAnthropicMessages._to_namespace(v) for k, v in value.items()})
++        if isinstance(value, list):
++            return [_CurlCffiAnthropicMessages._to_namespace(v) for v in value]
++        return value
++
++    def create(self, **kwargs):
++        try:
++            from curl_cffi import requests as curl_requests
++        except ImportError as exc:
++            raise ImportError(
++                "curl_cffi is required for NKQ's Cloudflare-protected Anthropic endpoint. "
++                "Install with: uv pip install curl_cffi"
++            ) from exc
++
++        extra_headers = kwargs.pop("extra_headers", None) or {}
++        extra_body = kwargs.pop("extra_body", None) or {}
++        kwargs.pop("extra_query", None)
++        if isinstance(extra_body, dict):
++            kwargs.update(extra_body)
++
++        endpoint = self._base_url
++        if not endpoint.endswith("/v1"):
++            endpoint = endpoint + "/v1"
++        url = endpoint + "/messages"
++
++        headers = {
++            "content-type": "application/json",
++            "x-api-key": self._api_key,
++            "anthropic-version": "2023-06-01",
++            **extra_headers,
++        }
++        response = curl_requests.post(
++            url,
++            headers=headers,
++            data=json.dumps(kwargs),
++            impersonate="safari17_0",
++            timeout=self._timeout,
++        )
++        if response.status_code >= 400:
++            raise RuntimeError(response.text)
++        return self._to_namespace(response.json())
++
++    def stream(self, **kwargs):
++        return _CurlCffiAnthropicStream(self, kwargs)
++
++
++class _CurlCffiAnthropicClient:
++    def __init__(self, api_key: str, base_url: str, timeout: float = None):
++        self.messages = _CurlCffiAnthropicMessages(api_key, base_url, timeout)
++
++
++def _is_nkq_anthropic_endpoint(base_url: str = None) -> bool:
++    return bool(base_url and "api.nkq.vn" in str(base_url).lower())
++
++
+ def build_anthropic_client(
+     api_key: str,
+     base_url: str = None,
+@@ -543,6 +630,11 @@ def build_anthropic_client(
+ 
+     normalize_proxy_env_vars()
+ 
++    if _is_nkq_anthropic_endpoint(base_url):
++        # NKQ is Anthropic-compatible but sits behind Cloudflare managed challenge.
++        # Python httpx/curl are challenged, while a Safari-like TLS fingerprint works.
++        return _CurlCffiAnthropicClient(api_key, base_url, timeout)
++
+     from httpx import Timeout
+ 
+     normalized_base_url = _normalize_base_url_text(base_url)
