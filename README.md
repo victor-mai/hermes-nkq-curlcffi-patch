@@ -251,21 +251,83 @@ OpenCode chạy trên Node.js và dùng stack HTTP/TLS khác. Từ cùng VPS, Op
 ## Rủi ro cần nhớ
 
 - `curl_cffi` là package trong venv/site-packages: Hermes update thường không xóa trực tiếp, nhưng recreate venv thì có thể mất.
-- `anthropic_adapter.py` là file trong Hermes source: Hermes update rất có thể ghi đè.
+- `anthropic_adapter.py` và `gateway/run.py` là file trong Hermes source: Hermes update rất có thể ghi đè cả hai.
 - Patch hiện tại chỉ activate khi `base_url` chứa `api.nkq.vn`; các endpoint Anthropic khác vẫn dùng client mặc định.
 - Stream hiện tại là real SSE streaming qua `curl_cffi` nếu NKQ trả `text/event-stream`; có fallback blocking nếu endpoint trả 2xx non-SSE.
 
-## Checklist sau Hermes update
+## Fix: Telegram Typing Indicator Disappears During Long Requests
+
+**Ngày:** 2026-05-08
+**Tình trạng:** ✅ Đã fix và verify — typing indicator giờ ổn định trong suốt request dài.
+
+### Vấn đề
+
+Trên proxy path (Telegram), `_run_agent_via_proxy()` trong `gateway/run.py` chỉ gửi `send_typing()` **1 lần duy nhất** → Telegram typing tự hết sau ~5s → indicator biến mất trong khi SSE stream còn đang chạy.
+
+Local CLI path (`_run_agent` qua `base.py`) không gặp vấn đề này vì có `_keep_typing` loop refresh mỗi 2s.
+
+### Root cause
+
+Sau khi fix SSE streaming (NKQ patch), request dài hơn → Telegram typing hết timeout sau 5s → không có loop refresh → typing biến mất.
+
+### Cách fix
+
+Thêm `_keep_typing` loop vào `_run_agent_via_proxy()` trong `gateway/run.py`:
+
+**Patch file:** `typing-fix.patch`
+
+**Thay đổi 1 — thêm loop trước SSE stream (line ~12981):**
+
+```python
+# Keep typing indicator alive during the SSE stream
+_stop_typing = asyncio.Event()
+
+async def _keep_typing_loop():
+    while not _stop_typing.is_set():
+        _typing_adapter = self.adapters.get(source.platform)
+        if _typing_adapter:
+            try:
+                await _typing_adapter.send_typing(source.chat_id, metadata=_thread_metadata)
+            except Exception:
+                pass
+        await asyncio.sleep(2.0)
+
+_typing_task = asyncio.create_task(_keep_typing_loop())
+```
+
+**Thay đổi 2 — cleanup trong `finally` block (line ~13075):**
+
+```python
+finally:
+    _stop_typing.set()
+    if _typing_task:
+        _typing_task.cancel()
+        try:
+            await _typing_task
+        except asyncio.CancelledError:
+            pass
+    # ... existing cleanup ...
+```
+
+### Checklist sau Hermes update
 
 1. Kiểm tra file có còn patch không:
 
 ```bash
 cd /root/.hermes/hermes-agent
 grep -n "curl_cffi\|_CurlCffiAnthropic\|api.nkq.vn" agent/anthropic_adapter.py
+grep -n "_keep_typing_loop\|_stop_typing" gateway/run.py
 ```
 
-2. Nếu không có, restore bằng Cách A hoặc B ở trên.
-3. Kiểm tra `curl_cffi`:
+2. Nếu `anthropic_adapter.py` không có → restore bằng Cách A hoặc B.
+3. Nếu `gateway/run.py` không có typing loop → apply `typing-fix.patch`:
+
+```bash
+cd /root/.hermes/hermes-agent
+git apply /root/.hermes/workspaces/hermes-nkq-curlcffi-patch/typing-fix.patch
+```
+
+4. Kiểm tra `curl_cffi`:
 
 ```bash
 cd /root/.hermes/hermes-agent
@@ -273,11 +335,11 @@ source venv/bin/activate
 python -c "import curl_cffi; print(curl_cffi.__file__)"
 ```
 
-4. Kiểm tra config:
+5. Kiểm tra config:
 
 ```bash
 hermes config | grep -A5 '^model:'
 ```
 
-5. Chạy smoke test `HERMES_NKQ_OK`.
-6. Restart gateway hoặc CLI.
+6. Chạy smoke test `HERMES_NKQ_OK`.
+7. Restart gateway hoặc CLI.
