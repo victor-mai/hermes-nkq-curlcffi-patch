@@ -45,6 +45,7 @@ Bản mới cũng hỗ trợ **real Anthropic SSE streaming** cho NKQ:
 - Reconstruct final message cho `get_final_message()`.
 - Khi gặp `tool_use`, Hermes/Telegram có thể nhận event sớm để hiện progress thay vì chờ model generate xong toàn bộ.
 - Nếu NKQ trả 2xx nhưng không phải SSE, fallback về blocking `create()` như bản cũ. Không fallback trên HTTP error như 429 để tránh double-spend request.
+- Nếu NKQ streaming trả ngay event lỗi `api_error: AI service temporarily unavailable.` trước khi có content, fallback sang blocking `create()` để tránh fail cả turn do lỗi riêng của SSE path.
 
 ## File Hermes gốc cần patch
 
@@ -202,7 +203,7 @@ final stop: tool_use
 final block: tool_use get_weather {'city': 'Hanoi'}
 ```
 
-Điều này giải quyết silent gap do bản cũ fake stream nhưng `__iter__` rỗng.
+Điều này giải quyết silent gap do bản cũ fake stream nhưng `__iter__` rỗng. Bản hiện tại cũng fallback sang blocking create khi NKQ trả lỗi SSE ngay từ đầu (`AI service temporarily unavailable`) trước khi có content.
 
 ## Cách verify sau khi restore
 
@@ -253,7 +254,7 @@ OpenCode chạy trên Node.js và dùng stack HTTP/TLS khác. Từ cùng VPS, Op
 - `curl_cffi` là package trong venv/site-packages: Hermes update thường không xóa trực tiếp, nhưng recreate venv thì có thể mất.
 - `anthropic_adapter.py` và `gateway/run.py` là file trong Hermes source: Hermes update rất có thể ghi đè cả hai.
 - Patch hiện tại chỉ activate khi `base_url` chứa `api.nkq.vn`; các endpoint Anthropic khác vẫn dùng client mặc định.
-- Stream hiện tại là real SSE streaming qua `curl_cffi` nếu NKQ trả `text/event-stream`; có fallback blocking nếu endpoint trả 2xx non-SSE.
+- Stream hiện tại là real SSE streaming qua `curl_cffi` nếu NKQ trả `text/event-stream`; có fallback blocking nếu endpoint trả 2xx non-SSE hoặc trả lỗi SSE ngay từ đầu kiểu `AI service temporarily unavailable`.
 
 ## Fix: Telegram Typing Indicator Disappears During Long Requests
 

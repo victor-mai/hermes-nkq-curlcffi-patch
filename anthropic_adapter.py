@@ -566,6 +566,8 @@ class _CurlCffiAnthropicStream:
                         event_type = None
                         data_lines = []
                         continue
+                    if self._maybe_fallback_from_initial_sse_error(payload):
+                        return
                     event = self._event_from_payload(event_type, payload)
                     self._apply_event_payload(payload)
                     yield event
@@ -585,9 +587,34 @@ class _CurlCffiAnthropicStream:
                 payload = json.loads("\n".join(data_lines))
             except json.JSONDecodeError:
                 return
+            if self._maybe_fallback_from_initial_sse_error(payload):
+                return
             event = self._event_from_payload(event_type, payload)
             self._apply_event_payload(payload)
             yield event
+
+    def _maybe_fallback_from_initial_sse_error(self, payload: dict) -> bool:
+        """Fallback to blocking create() when NKQ sends an immediate SSE error.
+
+        NKQ currently accepts the Safari-like curl_cffi request through
+        Cloudflare, but its streaming path can return a 200 text/event-stream
+        containing only an Anthropic error event (for example
+        "AI service temporarily unavailable.").  The non-streaming endpoint can
+        still succeed for the same request.  Only fallback before any content has
+        arrived; mid-stream errors must propagate to avoid duplicating partial
+        generations.
+        """
+        if payload.get("type") != "error":
+            return False
+        if self._message or self._content_blocks:
+            return False
+        error = payload.get("error") or {}
+        message = str(error.get("message") or payload)
+        if "temporarily unavailable" not in message.lower():
+            return False
+        self._fallback_to_create = True
+        self._final_message = self._messages_client.create(**self._kwargs)
+        return True
 
     def _event_from_payload(self, event_type: str, payload: dict):
         if event_type and "type" not in payload:
