@@ -15,7 +15,9 @@ Lý do đặt tên:
 ## Files trong folder này
 
 - `anthropic_adapter.py`: bản clone hiện tại của file đã patch.
-- `anthropic_adapter.patch`: git diff của thay đổi so với Hermes upstream checkout hiện tại, gồm curl_cffi + SSE streaming.
+- `anthropic_adapter.patch`: git diff NKQ API (curl_cffi + SSE streaming).
+- `typing-fix.patch`: git diff Telegram typing indicator loop.
+- `base-html-media.patch`: git diff thêm `.html` vào MEDIA regex.
 - `README.md`: tài liệu này.
 
 ## Vấn đề kỹ thuật
@@ -310,7 +312,71 @@ finally:
     # ... existing cleanup ...
 ```
 
+## Fix: MEDIA: .html files not sending via Telegram
+
+**Ngày:** 2026-05-21
+**Tình trạng:** ✅ Đã fix và verify — file `.html` gửi qua Telegram bằng `send_document()`.
+
+### Vấn đề
+
+Sau Hermes update ngày 2026-05-18, `MEDIA:/path/report.html` không gửi được qua Telegram. Trước đó vẫn hoạt động bình thường.
+
+### Root cause
+
+Hermes commit `ea49b3862` ("tighten MEDIA extraction regex") xóa fallback `|\S+` khỏi `extract_media()` regex trong `gateway/platforms/base.py`. Trước đó, regex bắt **mọi** `MEDIA:...` path bất kể extension nhờ fallback này. Sau khi xóa, `.html` không có trong extension list → regex không match → `MEDIA:/path/report.html` không được extract → không gửi.
+
+Commit `f2fdb9a17` ("feat(gateway): deliverable mode") thêm `.html` vào `extract_local_files()` nhưng **quên** thêm vào `extract_media()`.
+
+### Patch file
+
+`base-html-media.patch` — thêm `|html` vào extension list trong `media_pattern` regex tại `gateway/platforms/base.py`.
+
 ### Checklist sau Hermes update
+
+1. Kiểm tra `extract_media` regex có `.html` chưa:
+
+```bash
+grep -A2 "media_pattern.*re.compile" /root/.hermes/hermes-agent/gateway/platforms/base.py
+```
+
+2. Nếu thiếu `.html` → apply:
+
+```bash
+cd /root/.hermes/hermes-agent
+git apply /root/.hermes/workspaces/hermes-nkq-curlcffi-patch/base-html-media.patch
+```
+
+3. Verify pattern:
+
+```bash
+grep -o 'apk|ipa[^)]*' /root/.hermes/hermes-agent/gateway/platforms/base.py | grep html
+```
+
+Expected: `apk|ipa|html`
+
+4. Restart gateway:
+
+```bash
+hermes gateway restart
+```
+
+5. Test gửi file `.html`:
+
+```
+MEDIA:/tmp/test.html
+```
+
+**Chạy đủ 3 patch sau Hermes update:**
+
+```bash
+cd /root/.hermes/hermes-agent
+git apply hermes-nkq-curlcffi-patch/anthropic_adapter.patch
+git apply hermes-nkq-curlcffi-patch/typing-fix.patch
+git apply hermes-nkq-curlcffi-patch/base-html-media.patch
+hermes gateway restart
+```
+
+## Checklist sau Hermes update
 
 1. Kiểm tra file có còn patch không:
 
@@ -318,17 +384,13 @@ finally:
 cd /root/.hermes/hermes-agent
 grep -n "curl_cffi\|_CurlCffiAnthropic\|api.nkq.vn" agent/anthropic_adapter.py
 grep -n "_keep_typing_loop\|_stop_typing" gateway/run.py
+grep -o 'apk|ipa[^)]*' gateway/platforms/base.py | grep html
 ```
 
-2. Nếu `anthropic_adapter.py` không có → restore bằng Cách A hoặc B.
-3. Nếu `gateway/run.py` không có typing loop → apply `typing-fix.patch`:
-
-```bash
-cd /root/.hermes/hermes-agent
-git apply /root/.hermes/workspaces/hermes-nkq-curlcffi-patch/typing-fix.patch
-```
-
-4. Kiểm tra `curl_cffi`:
+2. Nếu `anthropic_adapter.py` không có NKQ code → restore bằng Cách A hoặc B.
+3. Nếu `gateway/run.py` không có typing loop → apply `typing-fix.patch`.
+4. Nếu `base.py` không có `.html` trong regex → apply `base-html-media.patch`.
+5. Kiểm tra `curl_cffi`:
 
 ```bash
 cd /root/.hermes/hermes-agent
@@ -336,11 +398,12 @@ source venv/bin/activate
 python -c "import curl_cffi; print(curl_cffi.__file__)"
 ```
 
-5. Kiểm tra config:
+6. Kiểm tra config:
 
 ```bash
 hermes config | grep -A5 '^model:'
 ```
 
-6. Chạy smoke test `HERMES_NKQ_OK`.
-7. Restart gateway hoặc CLI.
+7. Chạy smoke test `HERMES_NKQ_OK`.
+8. Restart gateway hoặc CLI.
+9. Test gửi file `.html` qua Telegram bằng `MEDIA:` tag.
