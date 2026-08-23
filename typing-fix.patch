@@ -1,8 +1,8 @@
 diff --git a/gateway/run.py b/gateway/run.py
-index 321f9b5ad..6877b9eee 100644
+index 9568eab2c..bce60e64c 100644
 --- a/gateway/run.py
 +++ b/gateway/run.py
-@@ -12978,6 +12978,21 @@ class GatewayRunner:
+@@ -15599,6 +15599,21 @@ class GatewayRunner:
              except Exception:
                  pass
  
@@ -24,7 +24,7 @@ index 321f9b5ad..6877b9eee 100644
          # Make the HTTP request with SSE streaming -----------------------
          full_response = ""
          _start = time.time()
-@@ -13060,6 +13075,14 @@ class GatewayRunner:
+@@ -15681,6 +15696,14 @@ class GatewayRunner:
                  }
              # Partial response — return what we got
          finally:
